@@ -1,0 +1,70 @@
+services:
+  camera-tracking:
+    image: ghcr.io/dsqt99/camera-tracking:rpi4-optimized
+    container_name: camera-tracking-rpi4-camera
+    platform: linux/arm64
+    
+    # Camera access
+    privileged: true
+    
+    # Disable AppArmor to avoid security profile conflicts
+    security_opt:
+      - apparmor:unconfined
+    
+    # Device mapping cho camera
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1  # Backup camera
+      - /dev/dri:/dev/dri        # GPU access cho hardware acceleration
+
+    # Volume mapping cho camera drivers (reduced to avoid AppArmor conflicts)
+    volumes:
+      - /dev:/dev
+      - /sys/class:/sys/class:ro
+      - /sys/bus:/sys/bus:ro
+    
+    # Environment variables tối ưu cho camera
+    environment:
+      - RTSP_URL=rtsp://admin:Oxiitek%4013579@192.168.2.12:10554/tcp/av0_0
+      - PYTHONUNBUFFERED=1
+      - OPENCV_VIDEOIO_PRIORITY_MSMF=0
+      - OPENCV_VIDEOIO_PRIORITY_V4L2=1
+      - OPENCV_VIDEOIO_PRIORITY_GSTREAMER=1
+      - GST_PLUGIN_PATH=/usr/lib/aarch64-linux-gnu/gstreamer-1.0
+      - DISPLAY=:99
+      - QT_QPA_PLATFORM=offscreen
+      - LIBGL_ALWAYS_INDIRECT=1
+      - V4L2_DEVICE=/dev/video0
+      - CAMERA_BUFFER_SIZE=1
+      - CAMERA_TIMEOUT=30
+      - RECONNECT_ATTEMPTS=5
+      - RECONNECT_DELAY=2
+
+    # Network mode cho RTSP access
+    network_mode: host
+    
+    # Resource limits
+    mem_limit: 1.5g
+    cpus: '3.0'
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check với camera test
+    healthcheck:
+      test: ["CMD", "python", "-c", "import cv2; cap = cv2.VideoCapture(0); ret, frame = cap.read(); cap.release(); exit(0 if ret else 1)"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default:
+    driver: bridge

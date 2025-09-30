@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Tracking - Đếm Người Ra Vào</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+        }
+        .content {
+            padding: 20px;
+        }
+        .video-container {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .video-stream {
+            max-width: 100%;
+            height: auto;
+            border: 3px solid #667eea;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .stat-card.in {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        .stat-card.out {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+        }
+        .stat-card.total {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            color: #333;
+        }
+        .stat-number {
+            font-size: 3em;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .stat-label {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        .controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            font-size: 1.1em;
+            cursor: pointer;
+            margin: 0 10px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);
+        }
+        .btn.reset {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+        }
+        .status {
+            text-align: center;
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .status.online {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.offline {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .info {
+            background-color: #e3f2fd;
+            border: 1px solid #bbdefb;
+            border-radius: 5px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        .info h3 {
+            margin-top: 0;
+            color: #1976d2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎥 Camera Tracking System</h1>
+            <p>Hệ thống đếm người ra vào tự động</p>
+        </div>
+        
+        <div class="content">
+            <div class="video-container">
+                <img id="videoStream" class="video-stream" src="/video_feed" alt="Video Stream">
+            </div>
+            
+            <div class="stats-container">
+                <div class="stat-card in">
+                    <div class="stat-number" id="peopleIn">0</div>
+                    <div class="stat-label">👆 Người Vào</div>
+                </div>
+                <div class="stat-card out">
+                    <div class="stat-number" id="peopleOut">0</div>
+                    <div class="stat-label">👇 Người Ra</div>
+                </div>
+                <div class="stat-card total">
+                    <div class="stat-number" id="totalPeople">0</div>
+                    <div class="stat-label">👥 Tổng Hiện Tại</div>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button class="btn" onclick="refreshStats()">🔄 Cập Nhật</button>
+                <button class="btn reset" onclick="resetCount()">🗑️ Reset Bộ Đếm</button>
+            </div>
+            
+            <div id="status" class="status online">
+                🟢 Hệ thống đang hoạt động
+            </div>
+            
+            <div class="info">
+                <h3>📋 Thông tin hệ thống:</h3>
+                <ul>
+                    <li><strong>RTSP URL:</strong> rtsp://admin:Oxiitek%4013579@192.168.2.58:10554/tcp/av0_0</li>
+                    <li><strong>Công nghệ:</strong> YOLOv8n + Centroid Tracker</li>
+                    <li><strong>Ngưỡng phát hiện:</strong> 40%</li>
+                    <li><strong>Vùng đếm:</strong> Line giữa frame (màu vàng)</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Cập nhật thống kê mỗi 1 giây để responsive hơn
+        function refreshStats() {
+            fetch('/stats')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // Cập nhật số liệu với hiệu ứng
+                    updateStatWithAnimation('peopleIn', data.people_in);
+                    updateStatWithAnimation('peopleOut', data.people_out);
+                    updateStatWithAnimation('totalPeople', data.total_people);
+                    
+                    // Cập nhật status
+                    const statusElement = document.getElementById('status');
+                    statusElement.className = 'status online';
+                    statusElement.textContent = '🟢 Hệ thống đang hoạt động';
+                    
+                    // Log để debug
+                    console.log(`Stats updated: In=${data.people_in}, Out=${data.people_out}, Total=${data.total_people}`);
+                })
+                .catch(error => {
+                    console.error('Lỗi khi lấy thống kê:', error);
+                    const statusElement = document.getElementById('status');
+                    statusElement.className = 'status offline';
+                    statusElement.textContent = '🔴 Lỗi kết nối: ' + error.message;
+                });
+        }
+        
+        // Reset bộ đếm
+        function resetCount() {
+            if (confirm('Bạn có chắc muốn reset bộ đếm?')) {
+                fetch('/reset_count', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        alert(data.message);
+                        refreshStats();
+                    })
+                    .catch(error => {
+                        console.error('Lỗi khi reset:', error);
+                        alert('Lỗi khi reset bộ đếm');
+                    });
+            }
+        }
+        
+        // Kiểm tra kết nối video stream
+        function checkVideoStream() {
+            const img = document.getElementById('videoStream');
+            img.onerror = function() {
+                const statusElement = document.getElementById('status');
+                statusElement.className = 'status offline';
+                statusElement.textContent = '🔴 Không thể kết nối camera';
+            };
+            img.onload = function() {
+                const statusElement = document.getElementById('status');
+                statusElement.className = 'status online';
+                statusElement.textContent = '🟢 Hệ thống đang hoạt động';
+            };
+        }
+        
+        // Hàm cập nhật số liệu với hiệu ứng
+        function updateStatWithAnimation(elementId, newValue) {
+            const element = document.getElementById(elementId);
+            const currentValue = parseInt(element.textContent) || 0;
+            
+            if (currentValue !== newValue) {
+                // Thêm hiệu ứng highlight khi số thay đổi
+                element.style.transform = 'scale(1.1)';
+                element.style.transition = 'transform 0.3s ease';
+                
+                setTimeout(() => {
+                    element.textContent = newValue;
+                    element.style.transform = 'scale(1)';
+                }, 150);
+            } else {
+                element.textContent = newValue;
+            }
+        }
+        
+        // Khởi tạo
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshStats();
+            checkVideoStream();
+            
+            // Tự động cập nhật thống kê mỗi 1 giây để responsive hơn
+            setInterval(refreshStats, 1000);
+            
+            console.log('Camera Tracking System initialized');
+        });
+    </script>
+</body>
+</html>
