@@ -1,10 +1,11 @@
 import os
 import cv2
 import time
+import numpy as np
+import tensorflow as tf
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from fastapi.templating import Jinja2Templates
-from ultralytics import YOLO
 import uvicorn
 import logging
 from dotenv import load_dotenv
@@ -24,7 +25,6 @@ CAMERA_TIMEOUT = int(os.getenv("CAMERA_TIMEOUT", "30"))
 RECONNECT_ATTEMPTS = int(os.getenv("RECONNECT_ATTEMPTS", "5"))
 RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "2"))
 
-# Dùng TCP thay UDP cho RTSP và ẩn bớt log FFmpeg
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|loglevel;quiet"
 
 # =========================
@@ -34,13 +34,20 @@ app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # =========================
-# Load YOLO model
+# Load YOLOv8n INT8 TFLite
 # =========================
-yolo_model = YOLO("detector/yolov8n.pt", task="detect")
+tflite_path = os.getenv("MODEL_PATH", "detector/yolov8n_saved_model/yolov8n_int8.tflite")
+interpreter = tf.lite.Interpreter(model_path=tflite_path)
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+input_height = input_details[0]['shape'][1]
+input_width = input_details[0]['shape'][2]
 
 # Biến lưu số người
 people_count = 0
-
 error_count = 0
 MAX_ERRORS = 50
 
@@ -48,9 +55,7 @@ MAX_ERRORS = 50
 # Hàm mở camera
 # =========================
 def open_camera():
-    """Mở camera theo ưu tiên: RTSP -> webcam -> None"""
     cap = None
-
     if RTSP_URL:
         logger.info(f"🔌 Thử kết nối RTSP: {RTSP_URL}")
         cap = cv2.VideoCapture(f"{RTSP_URL}?overrun_nonfatal=1&fifo_size=5000000", cv2.CAP_FFMPEG)
@@ -73,11 +78,36 @@ def open_camera():
     return None
 
 # =========================
+# Hàm detect với TFLite
+# =========================
+def detect_objects(frame):
+    global interpreter, input_details, output_details
+    # Resize + normalize
+    img_resized = cv2.resize(frame, (input_width, input_height))
+    input_data = np.expand_dims(img_resized, axis=0).astype(np.uint8)  # INT8 model
+    
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    # Lấy output (tuỳ vào cách export model, có thể có nhiều output)
+    boxes = interpreter.get_tensor(output_details[0]['index'])[0]  # [N,4]
+    scores = interpreter.get_tensor(output_details[1]['index'])[0]  # [N]
+    classes = interpreter.get_tensor(output_details[2]['index'])[0]  # [N]
+
+    rects = []
+    for i in range(len(scores)):
+        if scores[i] > 0.5 and int(classes[i]) == 0:  # class=0 (person)
+            y1, x1, y2, x2 = boxes[i]
+            h, w, _ = frame.shape
+            x1, y1, x2, y2 = int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+            rects.append((x1, y1, x2, y2))
+    return rects
+
+# =========================
 # Stream video + detect
 # =========================
 def generate_frames():
-    global people_count
-
+    global people_count, error_count
     attempts = 0
     cap = open_camera()
 
@@ -100,33 +130,18 @@ def generate_frames():
             continue
         else:
             error_count = 0
-
-
-        # Reset attempts nếu đã đọc được frame
-        attempts = 0
+            attempts = 0
 
         try:
-            # Detect YOLO
-            rects = []
-            results = yolo_model(frame, conf=0.5, verbose=False)
-            for result in results:
-                for box in result.boxes:
-                    cls = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    if cls == 0 and conf > 0.5:  # person
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        rects.append((int(x1), int(y1), int(x2), int(y2)))
-
-            # Update count
+            rects = detect_objects(frame)
             people_count = len(rects)
 
-            # Vẽ bbox
             for (x1, y1, x2, y2) in rects:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
             cv2.putText(frame, f"People: {people_count}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # Encode frame
             ret, buffer = cv2.imencode(".jpg", frame)
             if ret:
                 frame_bytes = buffer.tobytes()

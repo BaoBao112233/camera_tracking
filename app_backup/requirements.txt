@@ -3,5 +3,6 @@ uvicorn[standard]==0.22.0
 opencv-python-headless==4.8.0.76
 numpy==1.26.4
 python-dotenv==1.0.0
-ultralytics==8.0.190
+ultralytics
 torch==2.2.0
+tflite-runtime
