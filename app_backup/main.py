@@ -34,17 +34,22 @@ app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # =========================
-# Load YOLOv8n INT8 TFLite
+# Load YOLOv8n TFLite (INT8 / FLOAT32 đều OK)
 # =========================
-tflite_path = os.getenv("MODEL_PATH", "detector/yolov8n_saved_model/yolov8n_int8.tflite")
+tflite_path = os.getenv("MODEL_PATH", "detector/yolov8n_saved_model/yolov8n_float32.tflite")
 interpreter = tf.lite.Interpreter(model_path=tflite_path)
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
+logger.info(f"Model outputs: {len(output_details)}")
+for i, d in enumerate(output_details):
+    logger.info(f"Output {i}: name={d['name']}, shape={d['shape']}, dtype={d['dtype']}")
+
 input_height = input_details[0]['shape'][1]
 input_width = input_details[0]['shape'][2]
+input_dtype = input_details[0]['dtype']
 
 # Biến lưu số người
 people_count = 0
@@ -81,27 +86,39 @@ def open_camera():
 # Hàm detect với TFLite
 # =========================
 def detect_objects(frame):
-    global interpreter, input_details, output_details
-    # Resize + normalize
+    global interpreter, input_details, output_details, input_dtype
     img_resized = cv2.resize(frame, (input_width, input_height))
-    input_data = np.expand_dims(img_resized, axis=0).astype(np.uint8)  # INT8 model
-    
+
+    input_data = np.expand_dims(img_resized, axis=0).astype(input_dtype)
+    if input_dtype == np.float32:
+        input_data = input_data / 255.0
+
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
 
-    # Lấy output (tuỳ vào cách export model, có thể có nhiều output)
-    boxes = interpreter.get_tensor(output_details[0]['index'])[0]  # [N,4]
-    scores = interpreter.get_tensor(output_details[1]['index'])[0]  # [N]
-    classes = interpreter.get_tensor(output_details[2]['index'])[0]  # [N]
+    # YOLOv8 raw output [1, 84, 8400] -> (8400, 84)
+    preds = interpreter.get_tensor(output_details[0]['index'])[0].T
+
+    boxes = preds[:, :4]   # (x, y, w, h)
+    scores = preds[:, 4:]  # class scores
+
+    class_ids = np.argmax(scores, axis=1)
+    confidences = np.max(scores, axis=1)
 
     rects = []
-    for i in range(len(scores)):
-        if scores[i] > 0.5 and int(classes[i]) == 0:  # class=0 (person)
-            y1, x1, y2, x2 = boxes[i]
-            h, w, _ = frame.shape
-            x1, y1, x2, y2 = int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)
+    h, w, _ = frame.shape
+    for i in range(len(boxes)):
+        if confidences[i] > 0.5 and class_ids[i] == 0:  # class 0 = person
+            x, y, bw, bh = boxes[i]
+            # YOLOv8 boxes là center_x, center_y, width, height (normalized)
+            x1 = int((x - bw/2) * w)
+            y1 = int((y - bh/2) * h)
+            x2 = int((x + bw/2) * w)
+            y2 = int((y + bh/2) * h)
             rects.append((x1, y1, x2, y2))
+
     return rects
+
 
 # =========================
 # Stream video + detect
