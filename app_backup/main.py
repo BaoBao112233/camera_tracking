@@ -1,57 +1,29 @@
 import cv2
 import numpy as np
 import time
+import socket
+from datetime import datetime
 import json
 import os
 import threading
 from typing import Generator
 from collections import OrderedDict
-from fastapi import FastAPI, Response, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-from contextlib import asynccontextmanager
-import uvicorn
 from ultralytics import YOLO
-from dotenv import load_dotenv
 import torch
-torch.serialization.add_safe_globals([__import__("ultralytics").nn.tasks.DetectionModel])
+import asyncio
 
+# Thêm safe_globals khi load model
+with torch.serialization.safe_globals([torch.nn.Module, YOLO]):
+    yolo_model = YOLO('detector/yolov8n.pt', task='detect')
 
-# Load environment variables
-load_dotenv()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Quản lý lifecycle của ứng dụng
-    """
-    global CONFIDENCE_THRESHOLD, tracker, threaded_camera
-    
-    # Startup
-    initialize_detector()
-    initialize_pose_detector()
-    
-    # In thông tin cấu hình
-    print(f"🚀 Server đang khởi động...")
-    print(f"📹 RTSP URL: {RTSP_URL}")
-    server_config = config.get("server_config", {"host": "0.0.0.0", "port": 8000})
-    print(f"🌐 Server: http://{server_config['host']}:{server_config['port']}")
-    print(f"🎯 Confidence Threshold: {CONFIDENCE_THRESHOLD}")
-    print(f"📊 Tracker Config: {config.get('tracker_config', {})}")
-    print(f"🤸 Fall Detection: {'Enabled' if yolo_pose_model else 'Disabled'}")
-    
-    yield
-    
-    # Shutdown
-    if threaded_camera:
-        threaded_camera.stop()
-    print("🛑 Server đã tắt")
-
-app = FastAPI(title="Camera Tracking API", description="RTSP streaming với đếm người ra vào", lifespan=lifespan)
-
-# Thiết lập templates
+app = FastAPI()
 templates = Jinja2Templates(directory="templates")
+
+@app.get("/")
+async def root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 # Load cấu hình từ file JSON
 def load_config():
@@ -102,10 +74,14 @@ CONFIDENCE_THRESHOLD = config["confidence_threshold"]
 # Khởi tạo detector
 yolo_model = None
 
-# Biến đếm người
+# Biến đếm người (we only count people per-frame now)
 people_count_in = 0
 people_count_out = 0
 total_people = 0
+
+# Thông tin camera hiện tại (dùng để đưa vào JSON)
+CURRENT_CAMERA_SRC = None
+last_frame_stats = {}
 
 # Lưu trữ lịch sử vị trí của objects để theo dõi hướng di chuyển (tối đa 30 frame)
 previous_positions = {}
@@ -411,6 +387,39 @@ def initialize_pose_detector():
     except Exception as e:
         print(f"❌ Lỗi khi tải YOLO pose model: {e}")
         yolo_pose_model = None
+
+
+def get_device_ip() -> str:
+    """Return the primary IP address of the device (not loopback)"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # doesn't need to be reachable
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
+def get_device_name() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "raspberrypi"
+
+
+def build_frame_json(ip_camera, n_person: int) -> dict:
+    return {
+        "ip_rpi": get_device_ip(),
+        "name_rpi": get_device_name(),
+        "ip_camera": str(ip_camera) if ip_camera is not None else None,
+        "n_person": int(n_person),
+        "date": datetime.utcnow().isoformat() + "Z"
+    }
 
 def detect_people(frame):
     """
@@ -779,69 +788,20 @@ def analyze_pose_for_fall(keypoints, confidences, bbox):
 
 def count_people_crossing_line(objects, line_position, frame_width):
     """
-    Đếm người qua line giữa frame với độ nhạy cao
+    Thay thế: hàm này giờ chuyển thành cập nhật thống kê số người trong frame.
     Args:
         objects: Dictionary của tracked objects
-        line_position: Vị trí x của line (giữa frame)
-        frame_width: Chiều rộng frame
+        line_position, frame_width: (không dùng nữa nhưng giữ signature để tương thích)
     """
-    global people_count_in, people_count_out, total_people, previous_positions
-    
-    # Debug: In số lượng objects được track
-    if len(objects) > 0:
-        print(f"🔍 Tracking {len(objects)} objects: {list(objects.keys())}")
-    
-    for object_id, centroid in objects.items():
-        # Lấy vị trí hiện tại
-        current_x = centroid[0]
-        
-        # Debug: In vị trí của từng object
-        print(f"📍 Object {object_id}: current_x={current_x}, line_position={line_position}")
-        
-        # Kiểm tra nếu object đã có vị trí trước đó
-        if object_id in previous_positions:
-            # Lấy vị trí từ 30 frame trước (hoặc frame đầu tiên nếu chưa đủ)
-            position_history = previous_positions[object_id]
-            if len(position_history) > 0:
-                previous_x = position_history[0][0]  # Lấy vị trí x từ frame cũ nhất
-                print(f"📍 Object {object_id}: previous_x={previous_x} -> current_x={current_x} (từ {len(position_history)} frames trước)")
-                
-                # Logic crossing đơn giản và nhạy hơn
-                # Từ trái sang phải (vào)
-                if previous_x < line_position and current_x >= line_position:
-                    people_count_in += 1
-                    total_people += 1
-                    print(f"✅ Người vào: ID {object_id}, Tổng vào: {people_count_in}, Tổng hiện tại: {total_people}")
-                    # Reset lịch sử sau khi đếm để tránh đếm lặp
-                    previous_positions[object_id] = [centroid]
-                
-                # Từ phải sang trái (ra)
-                elif previous_x > line_position and current_x <= line_position:
-                    people_count_out += 1
-                    total_people = max(0, total_people - 1)  # Đảm bảo không âm
-                    print(f"✅ Người ra: ID {object_id}, Tổng ra: {people_count_out}, Tổng hiện tại: {total_people}")
-                    # Reset lịch sử sau khi đếm để tránh đếm lặp
-                    previous_positions[object_id] = [centroid]
-                else:
-                    # Thêm vị trí hiện tại vào lịch sử
-                    previous_positions[object_id].append(centroid)
-                    # Giữ tối đa 30 vị trí gần nhất (khoảng 30 frames)
-                    if len(previous_positions[object_id]) > 30:
-                        previous_positions[object_id].pop(0)
-            else:
-                # Nếu chưa có lịch sử, khởi tạo
-                previous_positions[object_id] = [centroid]
-        else:
-            print(f"🆕 Object {object_id} mới xuất hiện tại x={current_x}")
-            # Khởi tạo lịch sử vị trí cho object mới
-            previous_positions[object_id] = [centroid]
-    
-    # Xóa các object không còn được track
-    tracked_ids = set(objects.keys())
-    previous_ids = set(previous_positions.keys())
-    for old_id in previous_ids - tracked_ids:
-        print(f"🗑️ Xóa object {old_id} khỏi previous_positions")
-        del previous_positions[old_id]
+    global last_frame_stats
+    # Số người trong frame = số detections/tracked objects. Ở đây dùng số detections/objects.
+    # Caller có thể cập nhật dựa trên rects hoặc objects; chúng ta sẽ tính theo objects length
+    n_person = len(objects)
+    # Cập nhật last_frame_stats (ip_camera sẽ được cập nhật nơi khởi tạo camera)
+    ip_camera = CURRENT_CAMERA_SRC if CURRENT_CAMERA_SRC is not None else RTSP_URL
+    last_frame_stats = build_frame_json(ip_camera=ip_camera, n_person=n_person)
+    # Debug
+    print(f"📊 Frame stats updated: {last_frame_stats}")
 
 def generate_frames() -> Generator[bytes, None, None]:
     """
@@ -849,23 +809,36 @@ def generate_frames() -> Generator[bytes, None, None]:
     """
     global people_count_in, people_count_out, total_people, threaded_camera
     
-    # Khởi tạo threaded camera nếu chưa có
+    # Khởi tạo threaded camera nếu chưa có. Thử RTSP_URL trước nếu có, nếu không thì fallback webcam
+    global CURRENT_CAMERA_SRC
     if threaded_camera is None:
-        try:
-            print(f"🔄 Bắt đầu khởi tạo ThreadedCamera...")
-            threaded_camera = ThreadedCamera(RTSP_URL)
-            print(f"⏳ Đợi camera ổn định...")
-            time.sleep(3)  # Đợi camera khởi tạo và đọc frame đầu tiên
-            
-            # Kiểm tra camera có hoạt động không
-            test_ret, test_frame = threaded_camera.read()
-            if test_ret and test_frame is not None:
-                print(f"✅ ThreadedCamera hoạt động bình thường, frame size: {test_frame.shape}")
-            else:
-                print(f"⚠️ ThreadedCamera chưa sẵn sàng: ret={test_ret}, frame={test_frame is not None}")
-                
-        except Exception as e:
-            print(f"❌ Lỗi khởi tạo ThreadedCamera: {e}")
+        tried_sources = []
+        if RTSP_URL:
+            tried_sources.append(RTSP_URL)
+        # Thử webcam index 0 nếu RTSP không có hoặc lỗi
+        tried_sources.append(0)
+
+        for src in tried_sources:
+            try:
+                print(f"🔄 Thử khởi tạo ThreadedCamera với: {src}")
+                threaded_camera = ThreadedCamera(src)
+                CURRENT_CAMERA_SRC = src
+                print(f"⏳ Đợi camera ổn định...")
+                time.sleep(2)
+                test_ret, test_frame = threaded_camera.read()
+                if test_ret and test_frame is not None:
+                    print(f"✅ ThreadedCamera hoạt động bình thường với nguồn {src}, frame size: {test_frame.shape}")
+                    break
+                else:
+                    print(f"⚠️ Nguồn {src} chưa trả frame, thử nguồn kế tiếp")
+                    threaded_camera.stop()
+                    threaded_camera = None
+            except Exception as e:
+                print(f"❌ Không thể khởi tạo camera với {src}: {e}")
+                threaded_camera = None
+
+        if threaded_camera is None:
+            print("❌ Không có nguồn camera nào hoạt động. Kiểm tra RTSP_URL hoặc webcam.")
             return
     
     frame_skip_counter = 0
@@ -919,17 +892,14 @@ def generate_frames() -> Generator[bytes, None, None]:
         if len(objects) > 0:
             print(f"🎯 Tracker đang theo dõi {len(objects)} objects")
         
-        # Vẽ line giữa frame (dọc)
+        # Cập nhật thống kê: số người trong frame (dùng số detections trong rects)
         frame_height, frame_width = frame.shape[:2]
-        line_position = frame_width // 2
-        ui_config = config.get("ui_config", {})
-        line_color = ui_config.get("line_color", [0, 255, 255])
-        line_thickness = ui_config.get("line_thickness", 2)
-        cv2.line(frame, (line_position, 0), (line_position, frame_height), tuple(line_color), line_thickness)
-        
-        # Đếm người qua line
-        count_people_crossing_line(objects, line_position, frame_width)
-        
+        line_position = frame_width // 2  # giữ biến để hàm cũ có cùng signature
+        # Use detections count (rects) as people-in-frame
+        n_person = len(rects)
+        ip_camera = CURRENT_CAMERA_SRC if CURRENT_CAMERA_SRC is not None else RTSP_URL
+        last_frame_stats = build_frame_json(ip_camera=ip_camera, n_person=n_person)
+
         # Vẽ bounding boxes cho detected people
         ui_config = config.get("ui_config", {})
         bbox_color = tuple(ui_config.get("bbox_color", [0, 255, 0]))
@@ -937,33 +907,30 @@ def generate_frames() -> Generator[bytes, None, None]:
         text_color = tuple(ui_config.get("text_color", [0, 255, 0]))
         text_scale = ui_config.get("text_scale", 0.5)
         text_thickness = ui_config.get("text_thickness", 2)
-        
+
         for rect in rects:
             (start_x, start_y, end_x, end_y) = rect
             cv2.rectangle(frame, (start_x, start_y), (end_x, end_y), bbox_color, bbox_thickness)
-        
+
         # Vẽ centroids và IDs
         for (object_id, centroid) in objects.items():
             text = f"ID {object_id}"
             cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_color, text_thickness)
+                        cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_color, text_thickness)
             cv2.circle(frame, (centroid[0], centroid[1]), 4, text_color, -1)
-        
-        # Hiển thị thông tin đếm
-        info_text = f"Vao: {people_count_in} | Ra: {people_count_out} | Tong: {total_people}"
+
+        # Hiển thị thông tin đếm (số người hiện tại trong frame)
+        n_person = last_frame_stats.get('n_person', 0)
+        info_text = f"People in frame: {n_person}"
         cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        
-        # Hiển thị thông tin line
-        line_text = f"Line dem: X={line_position}"
-        cv2.putText(frame, line_text, (10, frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, tuple(line_color), 1)
-        
+
         # Encode frame
         ret, buffer = cv2.imencode('.jpg', frame)
         if ret:
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
+
         # Giảm thời gian sleep để tăng responsiveness
         time.sleep(0.01)  # Rất ngắn để giảm delay
 
@@ -977,9 +944,23 @@ def generate_fall_detection_frames() -> Generator[bytes, None, None]:
     if threaded_camera is None:
         try:
             print(f"🔄 Bắt đầu khởi tạo ThreadedCamera cho fall detection...")
-            threaded_camera = ThreadedCamera(RTSP_URL)
+            # Reuse the same fallback logic: thử RTSP trước rồi webcam
+            sources = [RTSP_URL] if RTSP_URL else []
+            sources.append(0)
+            for src in sources:
+                try:
+                    threaded_camera = ThreadedCamera(src)
+                    CURRENT_CAMERA_SRC = src
+                    print(f"✅ Fall detection camera khởi tạo với: {src}")
+                    break
+                except Exception as e:
+                    threaded_camera = None
+                    print(f"⚠️ Không thể mở nguồn fall detection với {src}: {e}")
+            if threaded_camera is None:
+                print("❌ Không có nguồn camera cho fall detection")
+                return
             print(f"⏳ Đợi camera ổn định...")
-            time.sleep(3)
+            time.sleep(2)
         except Exception as e:
             print(f"❌ Lỗi khởi tạo ThreadedCamera: {e}")
             return
@@ -1091,13 +1072,6 @@ def generate_fall_detection_frames() -> Generator[bytes, None, None]:
             print(f"❌ Lỗi trong generate_fall_detection_frames: {e}")
             time.sleep(0.1)
 
-@app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    """
-    Endpoint chính - hiển thị giao diện web
-    """
-    return templates.TemplateResponse("index.html", {"request": request})
-
 @app.get("/api")
 async def api_info():
     """
@@ -1138,160 +1112,31 @@ async def video_feed():
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
+
+@app.get("/frame_stats")
+async def frame_stats():
+    """Return last computed frame stats as JSON"""
+    global last_frame_stats
+    if not last_frame_stats:
+        # If empty, return a minimal object
+        return build_frame_json(ip_camera=(CURRENT_CAMERA_SRC or RTSP_URL), n_person=0)
+    return last_frame_stats
+
 @app.get("/stats")
 async def get_stats():
-    """
-    Endpoint để lấy thống kê đếm người
-    """
     return {
-        "people_in": people_count_in,
-        "people_out": people_count_out,
-        "total_people": total_people
+        "total_frames": frame_counter,
+        "current_fps": current_fps,
+        "detection_counts": detection_counts
     }
 
-@app.post("/reset_count")
-async def reset_count():
-    """
-    Reset bộ đếm
-    """
-    global people_count_in, people_count_out, total_people
-    people_count_in = 0
-    people_count_out = 0
-    total_people = 0
-    return {"message": "Đã reset bộ đếm"}
-
-# Fall Detection Routes
-@app.get("/fall_detection", response_class=HTMLResponse)
-async def fall_detection_page(request: Request):
-    """
-    Trang fall detection
-    """
-    return templates.TemplateResponse("fall_detection.html", {"request": request})
-
-@app.get("/fall_detection_feed")
-async def fall_detection_feed():
-    """
-    Endpoint để streaming video cho fall detection
-    """
-    return StreamingResponse(
-        generate_fall_detection_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-@app.post("/start_fall_detection")
-async def start_fall_detection():
-    """
-    Bắt đầu fall detection
-    """
-    global fall_detection_active
-    fall_detection_active = True
-    return {"message": "Đã bắt đầu fall detection", "status": "active"}
-
-@app.post("/stop_fall_detection")
-async def stop_fall_detection():
-    """
-    Dừng fall detection
-    """
-    global fall_detection_active
-    fall_detection_active = False
-    return {"message": "Đã dừng fall detection", "status": "inactive"}
-
-@app.get("/fall_detection_stats")
-async def get_fall_detection_stats():
-    """
-    Lấy thống kê fall detection
-    """
-    global total_falls, people_detected_fall, last_fall_time, fall_tracker, last_fall_tracker_id
-    
-    # Kiểm tra fall detection gần đây (trong 2 giây)
-    recent_fall = False
-    if last_fall_time and (time.time() - last_fall_time) < 2:
-        recent_fall = True
-    
-    # Thống kê fall tracker
-    active_trackers = len(fall_tracker)
-    currently_fallen = sum(1 for data in fall_tracker.values() if data.get('is_fallen', False))
-    
-    return {
-        "total_falls": total_falls,
-        "people_detected": people_detected_fall,
-        "fall_detected": recent_fall,
-        "last_fall_time": last_fall_time,
-        "last_fall_tracker_id": last_fall_tracker_id,
-        "detection_active": fall_detection_active,
-        "sensitivity": fall_sensitivity,
-        "confidence_threshold": fall_confidence_threshold,
-        "tracker_stats": {
-            "active_trackers": active_trackers,
-            "currently_fallen": currently_fallen,
-            "cooldown_time": fall_cooldown_time,
-            "max_duration": max_fall_duration
-        },
-        "pose_data": {
-            "keypoints": []  # Có thể mở rộng để trả về pose data chi tiết
-        }
-    }
-
-@app.post("/reset_fall_stats")
-async def reset_fall_stats():
-    """
-    Reset thống kê fall detection và fall tracker
-    """
-    global total_falls, people_detected_fall, last_fall_time, fall_tracker, last_fall_tracker_id
-    total_falls = 0
-    people_detected_fall = 0
-    last_fall_time = None
-    last_fall_tracker_id = None
-    fall_tracker.clear()  # Xóa tất cả tracking data
-    return {
-        "message": "Đã reset thống kê fall detection và fall tracker",
-        "total_falls": total_falls,
-        "active_trackers": len(fall_tracker)
-    }
-
-@app.post("/update_fall_sensitivity")
-async def update_fall_sensitivity(request: Request):
-    """
-    Cập nhật độ nhạy fall detection
-    """
-    global fall_sensitivity
-    try:
-        data = await request.json()
-        sensitivity = data.get("sensitivity", "medium")
-        if sensitivity in ["low", "medium", "high"]:
-            fall_sensitivity = sensitivity
-            return {"message": f"Đã cập nhật sensitivity: {sensitivity}", "sensitivity": fall_sensitivity}
-        else:
-            return {"error": "Sensitivity không hợp lệ"}, 400
-    except Exception as e:
-        return {"error": str(e)}, 400
-
-@app.post("/update_fall_confidence")
-async def update_fall_confidence(request: Request):
-    """
-    Cập nhật ngưỡng tin cậy fall detection
-    """
-    global fall_confidence_threshold
-    try:
-        data = await request.json()
-        confidence = data.get("confidence", 0.6)
-        if 0.3 <= confidence <= 0.9:
-            fall_confidence_threshold = confidence
-            return {"message": f"Đã cập nhật confidence: {confidence}", "confidence": fall_confidence_threshold}
-        else:
-            return {"error": "Confidence threshold phải từ 0.3 đến 0.9"}, 400
-    except Exception as e:
-        return {"error": str(e)}, 400
-
-if __name__ == "__main__":
-    server_config = config.get("server_config", {"host": "0.0.0.0", "port": 8000})
-    host = server_config.get("host", "0.0.0.0")
-    port = server_config.get("port", 8000)
-    
-    print(f"🚀 Khởi động Camera Tracking Server...")
-    print(f"📡 RTSP URL: {RTSP_URL}")
-    print(f"🌐 Server: http://{host}:{port}")
-    print(f"📊 Confidence threshold: {CONFIDENCE_THRESHOLD}")
-    print(f"🎯 Tracker config: {tracker_config}")
-    
-    uvicorn.run(app, host=host, port=port)
+# Xóa phần khởi tạo model trong process_video
+async def process_video():
+    global yolo_model, frame_counter, current_fps, detection_counts
+    # cap = cv2.VideoCapture(0)
+    # while True:
+    #     ret, frame = cap.read()
+    #     if not ret:
+    #         break
+    #     results = yolo_model(frame)
+    #     ... existing processing code ...
