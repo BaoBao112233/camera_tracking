@@ -12,9 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(
-    __name__
-    )
+logger = logging.getLogger(__name__)
 
 # =========================
 # Đọc biến môi trường
@@ -25,6 +23,9 @@ CAMERA_BUFFER_SIZE = int(os.getenv("CAMERA_BUFFER_SIZE", "1"))
 CAMERA_TIMEOUT = int(os.getenv("CAMERA_TIMEOUT", "30"))
 RECONNECT_ATTEMPTS = int(os.getenv("RECONNECT_ATTEMPTS", "5"))
 RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "2"))
+
+# Dùng TCP thay UDP cho RTSP và ẩn bớt log FFmpeg
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|loglevel;quiet"
 
 # =========================
 # Khởi tạo FastAPI
@@ -49,7 +50,7 @@ def open_camera():
 
     if RTSP_URL:
         logger.info(f"🔌 Thử kết nối RTSP: {RTSP_URL}")
-        cap = cv2.VideoCapture(RTSP_URL)
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         if cap.isOpened():
             logger.info("✅ Kết nối RTSP thành công")
             return cap
@@ -86,42 +87,44 @@ def generate_frames():
             continue
 
         ret, frame = cap.read()
-        if not ret:
-            logger.error("⚠️ Không đọc được frame, reconnect...")
-            cap.release()
-            cap = open_camera()
-            attempts += 1
+        if not ret or frame is None:
+            logger.warning("⚠️ Frame lỗi, bỏ qua...")
+            time.sleep(0.05)
             continue
 
         # Reset attempts nếu đã đọc được frame
         attempts = 0
 
-        # Detect YOLO
-        rects = []
-        results = yolo_model(frame, conf=0.5, verbose=False)
-        for result in results:
-            for box in result.boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                if cls == 0 and conf > 0.5:  # person
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    rects.append((int(x1), int(y1), int(x2), int(y2)))
+        try:
+            # Detect YOLO
+            rects = []
+            results = yolo_model(frame, conf=0.5, verbose=False)
+            for result in results:
+                for box in result.boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls == 0 and conf > 0.5:  # person
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        rects.append((int(x1), int(y1), int(x2), int(y2)))
 
-        # Update count
-        people_count = len(rects)
+            # Update count
+            people_count = len(rects)
 
-        # Vẽ bbox
-        for (x1, y1, x2, y2) in rects:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, f"People: {people_count}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Vẽ bbox
+            for (x1, y1, x2, y2) in rects:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"People: {people_count}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        # Encode frame
-        ret, buffer = cv2.imencode(".jpg", frame)
-        if ret:
-            frame_bytes = buffer.tobytes()
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+            # Encode frame
+            ret, buffer = cv2.imencode(".jpg", frame)
+            if ret:
+                frame_bytes = buffer.tobytes()
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+        except Exception as e:
+            logger.warning(f"⚠️ Lỗi xử lý frame: {e}")
+            continue
 
         time.sleep(0.05)
 
@@ -151,6 +154,7 @@ async def reset_count():
 @app.get("/ip_camera")
 async def ip_camera():
     return {"ip_camera": RTSP_URL}
+
 # =========================
 # Run service
 # =========================
