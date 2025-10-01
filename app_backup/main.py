@@ -10,16 +10,18 @@ from typing import Generator
 from collections import OrderedDict
 from fastapi import FastAPI, Request
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import StreamingResponse
 from ultralytics import YOLO
 import torch
 import asyncio
+from pathlib import Path
 
 # Thêm safe_globals khi load model
-with torch.serialization.safe_globals([torch.nn.Module, YOLO]):
-    yolo_model = YOLO('detector/yolov8n.pt', task='detect')
+yolo_model = YOLO('detector/yolov8n.pt', task='detect')
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+templates_dir = Path(__file__).parent / "templates"
+templates = Jinja2Templates(directory=str(templates_dir))
 
 @app.get("/")
 async def root(request: Request):
@@ -1124,6 +1126,7 @@ async def frame_stats():
 
 @app.get("/stats")
 async def get_stats():
+    global frame_counter, current_fps, detection_counts
     return {
         "total_frames": frame_counter,
         "current_fps": current_fps,
@@ -1140,3 +1143,7 @@ async def process_video():
     #         break
     #     results = yolo_model(frame)
     #     ... existing processing code ...
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
