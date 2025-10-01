@@ -34,7 +34,7 @@ app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 # =========================
-# Load YOLOv8n TFLite (INT8 / FLOAT32 đều OK)
+# Load YOLOv8n TFLite
 # =========================
 tflite_path = os.getenv("MODEL_PATH", "detector/yolov8n_saved_model/yolov8n_float32.tflite")
 interpreter = tf.lite.Interpreter(model_path=tflite_path)
@@ -43,18 +43,35 @@ interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-logger.info(f"Model outputs: {len(output_details)}")
-for i, d in enumerate(output_details):
-    logger.info(f"Output {i}: name={d['name']}, shape={d['shape']}, dtype={d['dtype']}")
-
 input_height = input_details[0]['shape'][1]
 input_width = input_details[0]['shape'][2]
 input_dtype = input_details[0]['dtype']
+
+logger.info(f"Model outputs: {len(output_details)}")
+for i, d in enumerate(output_details):
+    logger.info(f"Output {i}: name={d['name']}, shape={d['shape']}, dtype={d['dtype']}")
 
 # Biến lưu số người
 people_count = 0
 error_count = 0
 MAX_ERRORS = 50
+
+# =========================
+# Grid + Stride decode cho YOLOv8
+# =========================
+def make_grid(nx, ny, stride):
+    xv, yv = np.meshgrid(np.arange(nx), np.arange(ny))
+    grid = np.stack((xv, yv), 2).reshape(-1, 2)
+    return grid, np.full((grid.shape[0], 1), stride)
+
+# Tạo grid cho YOLOv8n (stride 8,16,32)
+grids, strides = [], []
+for stride, shape in zip([8, 16, 32], [80, 40, 20]):
+    g, s = make_grid(shape, shape, stride)
+    grids.append(g)
+    strides.append(s)
+grids = np.concatenate(grids, axis=0)       # (8400, 2)
+strides = np.concatenate(strides, axis=0)   # (8400, 1)
 
 # =========================
 # Hàm mở camera
@@ -83,10 +100,10 @@ def open_camera():
     return None
 
 # =========================
-# Hàm detect với TFLite
+# Decode output YOLOv8
 # =========================
 def detect_objects(frame):
-    global interpreter, input_details, output_details, input_dtype
+    global interpreter, input_details, output_details, input_dtype, grids, strides
     img_resized = cv2.resize(frame, (input_width, input_height))
 
     input_data = np.expand_dims(img_resized, axis=0).astype(input_dtype)
@@ -96,29 +113,33 @@ def detect_objects(frame):
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
 
-    # YOLOv8 raw output [1, 84, 8400] -> (8400, 84)
+    # Raw output [1,84,8400] → (8400,84)
     preds = interpreter.get_tensor(output_details[0]['index'])[0].T
+    boxes = preds[:, :4]
+    scores = preds[:, 4:]
 
-    boxes = preds[:, :4]   # (x, y, w, h)
-    scores = preds[:, 4:]  # class scores
+    # Decode YOLOv8 boxes
+    xy = (boxes[:, 0:2] * 2.0 - 0.5 + grids) * strides
+    wh = (boxes[:, 2:4] * 2.0) ** 2 * strides
+    xyxy = np.concatenate([xy - wh / 2, xy + wh / 2], axis=1)  # x1,y1,x2,y2
 
+    # Lấy conf & class
     class_ids = np.argmax(scores, axis=1)
     confidences = np.max(scores, axis=1)
 
     rects = []
     h, w, _ = frame.shape
-    for i in range(len(boxes)):
-        if confidences[i] > 0.5 and class_ids[i] == 0:  # class 0 = person
-            x, y, bw, bh = boxes[i]
-            # YOLOv8 boxes là center_x, center_y, width, height (normalized)
-            x1 = int((x - bw/2) * w)
-            y1 = int((y - bh/2) * h)
-            x2 = int((x + bw/2) * w)
-            y2 = int((y + bh/2) * h)
+    for i in range(len(xyxy)):
+        if confidences[i] > 0.5 and class_ids[i] == 0:  # person
+            x1, y1, x2, y2 = xyxy[i]
+            # scale về kích thước frame gốc
+            x1 = int(x1 * w / input_width)
+            y1 = int(y1 * h / input_height)
+            x2 = int(x2 * w / input_width)
+            y2 = int(y2 * h / input_height)
             rects.append((x1, y1, x2, y2))
 
     return rects
-
 
 # =========================
 # Stream video + detect
