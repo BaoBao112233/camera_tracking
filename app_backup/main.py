@@ -6,6 +6,12 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from ultralytics import YOLO
 import uvicorn
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(
+    __name__
+    )
 
 # =========================
 # Đọc biến môi trường
@@ -39,24 +45,24 @@ def open_camera():
     cap = None
 
     if RTSP_URL:
-        print(f"🔌 Thử kết nối RTSP: {RTSP_URL}")
+        logger.info(f"🔌 Thử kết nối RTSP: {RTSP_URL}")
         cap = cv2.VideoCapture(RTSP_URL)
         if cap.isOpened():
-            print("✅ Kết nối RTSP thành công")
+            logger.info("✅ Kết nối RTSP thành công")
             return cap
         else:
-            print("❌ Không kết nối được RTSP")
+            logger.error("❌ Không kết nối được RTSP")
 
     if V4L2_DEVICE and os.path.exists(V4L2_DEVICE):
-        print(f"🔌 Thử kết nối webcam: {V4L2_DEVICE}")
+        logger.info(f"🔌 Thử kết nối webcam: {V4L2_DEVICE}")
         cap = cv2.VideoCapture(V4L2_DEVICE)
         if cap.isOpened():
-            print("✅ Kết nối webcam thành công")
+            logger.info("✅ Kết nối webcam thành công")
             return cap
         else:
-            print("❌ Không mở được webcam")
+            logger.error("❌ Không mở được webcam")
 
-    print("⚠️ Không có camera nào khả dụng")
+    logger.error("⚠️ Không có camera nào khả dụng")
     return None
 
 # =========================
@@ -70,7 +76,7 @@ def generate_frames():
 
     while attempts < RECONNECT_ATTEMPTS:
         if not cap or not cap.isOpened():
-            print(f"🔁 Thử reconnect ({attempts+1}/{RECONNECT_ATTEMPTS})...")
+            logger.info(f"🔁 Thử reconnect ({attempts+1}/{RECONNECT_ATTEMPTS})...")
             time.sleep(RECONNECT_DELAY)
             cap = open_camera()
             attempts += 1
@@ -78,7 +84,7 @@ def generate_frames():
 
         ret, frame = cap.read()
         if not ret:
-            print("⚠️ Không đọc được frame, reconnect...")
+            logger.error("⚠️ Không đọc được frame, reconnect...")
             cap.release()
             cap = open_camera()
             attempts += 1
@@ -139,6 +145,9 @@ async def reset_count():
     people_count = 0
     return {"message": "Bộ đếm đã được reset"}
 
+@app.get("/ip_camera")
+async def ip_camera():
+    return {"ip_camera": RTSP_URL}
 # =========================
 # Run service
 # =========================
