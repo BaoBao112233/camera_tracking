@@ -41,6 +41,9 @@ yolo_model = YOLO("detector/yolov8n.pt", task="detect")
 # Biến lưu số người
 people_count = 0
 
+error_count = 0
+MAX_ERRORS = 50
+
 # =========================
 # Hàm mở camera
 # =========================
@@ -50,7 +53,7 @@ def open_camera():
 
     if RTSP_URL:
         logger.info(f"🔌 Thử kết nối RTSP: {RTSP_URL}")
-        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        cap = cv2.VideoCapture(f"{RTSP_URL}?overrun_nonfatal=1&fifo_size=5000000", cv2.CAP_FFMPEG)
         if cap.isOpened():
             logger.info("✅ Kết nối RTSP thành công")
             return cap
@@ -88,9 +91,16 @@ def generate_frames():
 
         ret, frame = cap.read()
         if not ret or frame is None:
-            logger.warning("⚠️ Frame lỗi, bỏ qua...")
-            time.sleep(0.05)
+            error_count += 1
+            if error_count > MAX_ERRORS:
+                logger.error("🚨 Quá nhiều frame lỗi, reconnect camera...")
+                cap.release()
+                cap = open_camera()
+                error_count = 0
             continue
+        else:
+            error_count = 0
+
 
         # Reset attempts nếu đã đọc được frame
         attempts = 0
